@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# updateall - update everything on ubuntu/debian in one command
+# handles: apt, snap, flatpak, firmware, npm globals, pip user packages
+# logs everything, shows what changed, cleans up after itself
+#
+
+set -o pipefail
+
+# ── colors ────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    g='\033[32m' b='\033[1;34m' y='\033[33m' r='\033[31m'
+    c='\033[36m' d='\033[2m'    n='\033[0m'
+else
+    g='' b='' y='' r='' c='' d='' n=''
+fi
+
+# ── setup ─────────────────────────────────────────────────────────────────────
+LOG_DIR="$HOME/.cache/updateall"
+mkdir -p "$LOG_DIR"
+
+# clean logs older than 7 days
+find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null
+
+LOGFILE="$LOG_DIR/$(date +%F_%H%M%S).log"
+t_start=$(date +%s)
+disk_before=$(df / | awk 'NR==2{print $4}')
+total_updated=0
+total_steps=0
+failed_steps=0
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+step() {
+    local label="$1"; shift
+    (( total_steps++ ))
+    printf "  ${g}%-38s${n}" "$label"
+    echo -e "\n=== [$label] $(date +%T) ===" >> "$LOGFILE"
+
+    local output
+    output=$("$@" 2>&1) || { echo -e "${r}✗${n}"; echo "$output" >> "$LOGFILE"; (( failed_steps++ )); return 1; }
+    echo "$output" >> "$LOGFILE"
+    echo -e "${g}✓${n}"
+
+    # try to count updated packages from output
+    local count
+    count=$(echo "$output" | grep -cE "^(Inst |Get:|Unpacking|Setting up)" 2>/dev/null || true)
+    [[ $count -gt 0 ]] && total_updated=$((total_updated + count))
+}
+
+header() {
+    echo -e "\n${b}[$1]${n}"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+echo -e "\n${b}updateall${n} ${d}— $(date '+%b %d %H:%M')${n}\n"
+
+# apt
+header "apt"
+step "updating package lists"       sudo apt-get update -qq
+step "upgrading packages"           sudo apt-get upgrade -y -qq
+step "full-upgrade"                 sudo apt-get full-upgrade -y -qq
+step "removing unused packages"     sudo apt-get autoremove -y -qq
+step "cleaning cache"               sudo apt-get autoclean -qq
+
+# snap
+if command -v snap &>/dev/null; then
+    header "snap"
+    step "refreshing snaps"         sudo snap refresh
+fi
+
+# flatpak
+if command -v flatpak &>/dev/null; then
+    header "flatpak"
+    step "updating flatpaks"        flatpak update -y --noninteractive
+fi
+
+# firmware
+if command -v fwupdmgr &>/dev/null; then
+    header "firmware"
+    step "checking firmware"        bash -c 'sudo fwupdmgr refresh --force 2>/dev/null; sudo fwupdmgr update -y 2>/dev/null; exit 0'
+fi
+
+# npm globals (if nvm/node is available)
+if command -v npm &>/dev/null; then
+    outdated_npm=$(npm outdated -g --parseable 2>/dev/null | wc -l)
+    if [[ $outdated_npm -gt 0 ]]; then
+        header "npm"
+        step "updating $outdated_npm global packages"  npm update -g
+    fi
+fi
+
+# pip user packages
+if command -v pip3 &>/dev/null; then
+    pip_outdated=$(pip3 list --outdated --user --format=columns 2>/dev/null | tail -n +3 | awk '{print $1}' | tr '\n' ' ')
+    if [[ -n "$pip_outdated" ]]; then
+        header "pip"
+        step "upgrading user packages"  pip3 install --user --upgrade $pip_outdated
+    fi
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────────
+t_end=$(date +%s)
+elapsed=$((t_end - t_start))
+disk_after=$(df / | awk 'NR==2{print $4}')
+freed_kb=$((disk_after - disk_before))
+
+mins=$((elapsed / 60))
+secs=$((elapsed % 60))
+
+echo -e "\n${b}────────────────────────────────────${n}"
+printf "${g}done${n}"
+if [[ $mins -gt 0 ]]; then
+    printf "  ${d}%dm %ds${n}" "$mins" "$secs"
+else
+    printf "  ${d}%ds${n}" "$secs"
+fi
+
+[[ $total_updated -gt 0 ]] && printf "  ${c}%d packages${n}" "$total_updated"
+[[ $freed_kb -gt 1024 ]]   && printf "  ${c}freed %dMB${n}" "$((freed_kb / 1024))"
+[[ $failed_steps -gt 0 ]]  && printf "  ${r}%d failed${n}" "$failed_steps"
+echo ""
+
+if [[ -f /var/run/reboot-required ]]; then
+    echo -e "${y}reboot required${n}"
+fi
+
+echo -e "${d}log: $LOGFILE${n}"
+echo -e "${b}────────────────────────────────────${n}\n"
