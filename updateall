@@ -98,6 +98,20 @@ if command -v pip3 &>/dev/null; then
     fi
 fi
 
+# brew (linuxbrew)
+if command -v brew &>/dev/null; then
+    header "brew"
+    step "brew update"              brew update
+    step "brew upgrade"             brew upgrade
+    step "brew cleanup"             brew cleanup
+fi
+
+# rustup
+if command -v rustup &>/dev/null; then
+    header "rustup"
+    step "updating rust toolchain"  rustup update
+fi
+
 # ── summary ───────────────────────────────────────────────────────────────────
 t_end=$(date +%s)
 elapsed=$((t_end - t_start))

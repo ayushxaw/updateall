@@ -6,7 +6,7 @@ one command to update your entire ubuntu/debian system.
 sudo updateall
 ```
 
-handles **apt**, **snap**, **flatpak**, **firmware**, **npm globals**, and **pip user packages** — runs each one, logs everything, and shows a clean summary at the end.
+handles **apt**, **snap**, **flatpak**, **firmware**, **npm globals**, **pip user packages**, **homebrew**, and **rustup** — runs each one, logs everything, and shows a clean summary at the end.
 
 ## what it does
 
@@ -67,6 +67,8 @@ no config needed. it auto-detects which package managers you have:
 | firmware | `command -v fwupdmgr` |
 | npm | `command -v npm` |
 | pip | `command -v pip3` |
+| brew | `command -v brew` |
+| rust | `command -v rustup` |
 
 ## license
 
