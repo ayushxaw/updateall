@@ -1,142 +1,179 @@
 #!/usr/bin/env bash
-#
-# updateall - update everything on ubuntu/debian in one command
-# handles: apt, snap, flatpak, firmware, npm globals, pip user packages
-# logs everything, shows what changed, cleans up after itself
-#
-
+# Update installed system and user packages on Ubuntu/Debian.
 set -o pipefail
 
-# ── colors ────────────────────────────────────────────────────────────────────
-if [[ -t 1 ]]; then
-    g='\033[32m' b='\033[1;34m' y='\033[33m' r='\033[31m'
-    c='\033[36m' d='\033[2m'    n='\033[0m'
-else
-    g='' b='' y='' r='' c='' d='' n=''
+usage() {
+    cat <<'HELP'
+Usage: updateall [--full] [--cleanup] [--firmware]
+
+Run as your normal user. System updates ask for sudo when needed.
+  --full      Use APT full-upgrade, with an interactive removal review.
+  --cleanup   Review APT and Homebrew cleanup after upgrading.
+  --firmware  Offer to install firmware updates. The default only checks.
+  --help      Show this help.
+HELP
+}
+
+full=0
+cleanup=0
+install_firmware=0
+for option; do
+    case "$option" in
+        --full) full=1 ;;
+        --cleanup) cleanup=1 ;;
+        --firmware) install_firmware=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$option" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if (( EUID == 0 )); then
+    printf 'Run updateall as your normal user. It calls sudo for system updates.\n' >&2
+    exit 2
 fi
 
-# ── setup ─────────────────────────────────────────────────────────────────────
-LOG_DIR="$HOME/.cache/updateall"
-mkdir -p "$LOG_DIR"
+umask 077
+log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/updateall"
+mkdir -p -- "$log_dir" || exit 1
+exec 9> "$log_dir/run.lock" || exit 1
+if ! flock -n 9; then
+    printf 'Another updateall run is already active.\n' >&2
+    exit 1
+fi
+find "$log_dir" -maxdepth 1 -type f -name '*.log' -mtime +7 -delete || exit 1
+log_file=$(mktemp "$log_dir/$(date +%F_%H%M%S)_XXXXXX.log") || exit 1
+started=$SECONDS
+failures=0
+# Run global package managers outside whichever project launched updateall.
+cd / || exit 1
 
-# clean logs older than 7 days
-find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null
-
-LOGFILE="$LOG_DIR/$(date +%F_%H%M%S).log"
-t_start=$(date +%s)
-disk_before=$(df / | awk 'NR==2{print $4}')
-total_updated=0
-total_steps=0
-failed_steps=0
-
-# ── helpers ───────────────────────────────────────────────────────────────────
+# The command keeps its terminal input for sudo and package-manager prompts.
+# fwupdmgr uses status 2 when there are no updates to apply.
 step() {
-    local label="$1"; shift
-    (( total_steps++ ))
-    printf "  ${g}%-38s${n}" "$label"
-    echo -e "\n=== [$label] $(date +%T) ===" >> "$LOGFILE"
-
-    local output
-    output=$("$@" 2>&1) || { echo -e "${r}✗${n}"; echo "$output" >> "$LOGFILE"; (( failed_steps++ )); return 1; }
-    echo "$output" >> "$LOGFILE"
-    echo -e "${g}✓${n}"
-
-    # try to count updated packages from output
-    local count
-    count=$(echo "$output" | grep -cE "^(Inst |Get:|Unpacking|Setting up)" 2>/dev/null || true)
-    [[ $count -gt 0 ]] && total_updated=$((total_updated + count))
+    local label=$1 no_action_status=$2
+    local -a status
+    shift 2
+    if ! printf '\n[%s]\n' "$label" | tee -a "$log_file"; then
+        (( failures += 1 ))
+        return 1
+    fi
+    "$@" 2>&1 | tee -a "$log_file"
+    status=("${PIPESTATUS[@]}")
+    if (( status[1] != 0 || (status[0] != 0 && status[0] != no_action_status) )); then
+        (( failures += 1 ))
+        printf 'Failed (command %s, log %s).\n' "${status[0]}" "${status[1]}" | tee -a "$log_file"
+        return 1
+    fi
+    printf 'OK\n' | tee -a "$log_file"
 }
 
-header() {
-    echo -e "\n${b}[$1]${n}"
+note() {
+    printf '%s\n' "$*" | tee -a "$log_file"
 }
 
-# ── main ──────────────────────────────────────────────────────────────────────
-echo -e "\n${b}updateall${n} ${d}— $(date '+%b %d %H:%M')${n}\n"
+has() { command -v "$1" >/dev/null 2>&1; }
 
-# apt
-header "apt"
-step "updating package lists"       sudo apt-get update -qq
-step "upgrading packages"           sudo apt-get upgrade -y -qq
-step "full-upgrade"                 sudo apt-get full-upgrade -y -qq
-step "removing unused packages"     sudo apt-get autoremove -y -qq
-step "cleaning cache"               sudo apt-get autoclean -qq
+update_user_python() {
+    local python_environment outdated
+    python_environment=$(python3 -I -c '
+from pathlib import Path
+import sys
+import sysconfig
 
-# snap
-if command -v snap &>/dev/null; then
-    header "snap"
-    step "refreshing snaps"         sudo snap refresh
-fi
-
-# flatpak
-if command -v flatpak &>/dev/null; then
-    header "flatpak"
-    step "updating flatpaks"        flatpak update -y --noninteractive
-fi
-
-# firmware
-if command -v fwupdmgr &>/dev/null; then
-    header "firmware"
-    step "checking firmware"        bash -c 'sudo fwupdmgr refresh --force 2>/dev/null; sudo fwupdmgr update -y 2>/dev/null; exit 0'
-fi
-
-# npm globals (if nvm/node is available)
-if command -v npm &>/dev/null; then
-    outdated_npm=$(npm outdated -g --parseable 2>/dev/null | wc -l)
-    if [[ $outdated_npm -gt 0 ]]; then
-        header "npm"
-        step "updating $outdated_npm global packages"  npm update -g
+if sys.prefix != sys.base_prefix:
+    print("virtual")
+elif (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").is_file():
+    print("managed")
+') || return 1
+    if [[ $python_environment == virtual ]]; then
+        printf 'Skipping pip user packages while a Python environment is active.\n'
+        return 0
     fi
-fi
-
-# pip user packages
-if command -v pip3 &>/dev/null; then
-    pip_outdated=$(pip3 list --outdated --user --format=columns 2>/dev/null | tail -n +3 | awk '{print $1}' | tr '\n' ' ')
-    if [[ -n "$pip_outdated" ]]; then
-        header "pip"
-        step "upgrading user packages"  pip3 install --user --upgrade $pip_outdated
+    if [[ $python_environment == managed ]]; then
+        printf 'Skipping pip user packages because this Python is managed by the OS.\n'
+        return 0
     fi
-fi
+    outdated=$(python3 -m pip list --outdated --user --format=json |
+        python3 -I -c 'import json, sys; print("\n".join(item["name"] for item in json.load(sys.stdin)))') || return 1
+    if [[ -z $outdated ]]; then
+        printf 'No outdated pip user packages.\n'
+        return 0
+    fi
+    local -a packages
+    mapfile -t packages <<< "$outdated"
+    python3 -m pip install --user --upgrade -- "${packages[@]}"
+}
 
-# brew (linuxbrew)
-if command -v brew &>/dev/null; then
-    header "brew"
-    step "brew update"              brew update
-    step "brew upgrade"             brew upgrade
-    step "brew cleanup"             brew cleanup
-fi
-
-# rustup
-if command -v rustup &>/dev/null; then
-    header "rustup"
-    step "updating rust toolchain"  rustup update
-fi
-
-# ── summary ───────────────────────────────────────────────────────────────────
-t_end=$(date +%s)
-elapsed=$((t_end - t_start))
-disk_after=$(df / | awk 'NR==2{print $4}')
-freed_kb=$((disk_after - disk_before))
-
-mins=$((elapsed / 60))
-secs=$((elapsed % 60))
-
-echo -e "\n${b}────────────────────────────────────${n}"
-printf "${g}done${n}"
-if [[ $mins -gt 0 ]]; then
-    printf "  ${d}%dm %ds${n}" "$mins" "$secs"
+note "updateall — $(date '+%F %T')"
+if step 'APT package lists' 0 sudo apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update; then
+    if (( full )); then
+        step 'APT full upgrade' 0 sudo apt-get full-upgrade
+        apt_status=$?
+    else
+        step 'APT upgrade' 0 sudo apt-get --with-new-pkgs --no-remove upgrade
+        apt_status=$?
+    fi
+    if (( apt_status == 0 && cleanup )); then
+        if step 'APT autoremove' 0 sudo apt-get autoremove; then
+            step 'APT autoclean' 0 sudo apt-get autoclean
+        fi
+    fi
 else
-    printf "  ${d}%ds${n}" "$secs"
+    note 'Skipped APT upgrade because the package lists could not be refreshed.'
 fi
 
-[[ $total_updated -gt 0 ]] && printf "  ${c}%d packages${n}" "$total_updated"
-[[ $freed_kb -gt 1024 ]]   && printf "  ${c}freed %dMB${n}" "$((freed_kb / 1024))"
-[[ $failed_steps -gt 0 ]]  && printf "  ${r}%d failed${n}" "$failed_steps"
-echo ""
-
-if [[ -f /var/run/reboot-required ]]; then
-    echo -e "${y}reboot required${n}"
+if has snap; then
+    step 'Snap refresh' 0 sudo snap refresh
+fi
+if has flatpak; then
+    step 'Flatpak system updates' 0 flatpak --system update
+    step 'Flatpak user updates' 0 flatpak --user update
+fi
+if has fwupdmgr; then
+    if step 'Firmware metadata' 2 fwupdmgr refresh; then
+        if (( install_firmware )); then
+            step 'Firmware installation' 2 fwupdmgr update
+        else
+            step 'Firmware update check' 2 fwupdmgr get-updates
+        fi
+    fi
+fi
+if has npm; then
+    if npm_prefix=$(npm prefix -g 2>>"$log_file"); then
+        if [[ -w $npm_prefix/lib/node_modules ]]; then
+            step 'npm global packages' 0 npm update --global
+        else
+            note "Skipped npm globals because $npm_prefix/lib/node_modules is absent or read-only."
+        fi
+    else
+        (( failures += 1 ))
+        note 'Could not determine the npm global prefix. See the log.'
+    fi
+fi
+if has python3 && python3 -m pip --version >/dev/null 2>&1; then
+    if [[ -n ${VIRTUAL_ENV:-} || -n ${CONDA_PREFIX:-} ]]; then
+        note 'Skipped pip user packages while a Python environment is active.'
+    else
+        step 'Python user packages' 0 update_user_python
+    fi
+fi
+if has pipx; then
+    step 'pipx applications' 0 pipx upgrade-all
+fi
+if has brew; then
+    if step 'Homebrew metadata' 0 brew update && step 'Homebrew packages' 0 brew upgrade; then
+        if (( cleanup )); then
+            step 'Homebrew cleanup' 0 brew cleanup
+        fi
+    fi
+fi
+if has rustup; then
+    step 'Rust toolchains' 0 rustup update
 fi
 
-echo -e "${d}log: $LOGFILE${n}"
-echo -e "${b}────────────────────────────────────${n}\n"
+note "Finished in $((SECONDS - started))s ($failures failed)."
+if [[ -e /var/run/reboot-required ]]; then
+    note 'Reboot required.'
+fi
+note "Log: $log_file" || exit 1
+(( failures == 0 ))

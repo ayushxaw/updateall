@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-#
-# install updateall system-wide
-#
-
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-echo "installing updateall..."
-
-sudo rm -f /usr/local/bin/updateall
-sudo cp "$SCRIPT_DIR/updateall" /usr/local/bin/updateall
-sudo chmod +x /usr/local/bin/updateall
-
-echo "done. run 'updateall' from any terminal."
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+case "${1:-}" in
+    '')
+        sudo install -T -m 0755 -- "$script_dir/updateall" /usr/local/bin/updateall
+        ;;
+    --user)
+        install -d -- "$HOME/.local/bin"
+        install -T -m 0755 -- "$script_dir/updateall" "$HOME/.local/bin/updateall"
+        ;;
+    *)
+        printf 'Usage: bash install.sh [--user]\n' >&2
+        exit 2
+        ;;
+esac
+printf 'Installed. Run updateall as your normal user.\n'
