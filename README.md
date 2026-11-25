@@ -1,19 +1,28 @@
 # updateall
 
-Update Ubuntu or Debian packages and supported desktop apps in one command.
-Run it from your normal account. System updates can prompt for administrator approval.
+Run one command to update the software managed by your Ubuntu or Debian system.
 
 ```bash
 updateall
 ```
 
-- Refreshes APT package lists before upgrading. The default upgrade allows new dependencies and blocks package removals.
-- Refreshes Snap and both system and personal Flatpak installations when available.
-- Checks for firmware updates. Use `--firmware` to review and install them.
-- Updates writable npm globals, pipx apps, Homebrew packages, and Rust toolchains when their managers are available. Pip user upgrades are skipped under OS-managed Python or while a Python environment is active.
-- Shows update output, reports failures with a nonzero exit status, and saves a log under `${XDG_CACHE_HOME:-$HOME/.cache}/updateall`. Logs older than seven days are removed.
+`updateall` asks for your administrator password once, then updates APT packages, Snaps, system and user Flatpaks, firmware, writable npm globals, supported Python user packages, pipx apps, user Ruby gems, Homebrew packages, and Rust toolchains when they are installed.
 
-Use `--full` to review an APT full upgrade that may remove packages. Use `--cleanup` to review APT autoremove and clean the APT and Homebrew caches after successful upgrades.
+APT uses a full upgrade and includes Ubuntu phased updates. It also removes unused packages and cleans the APT cache. APT covers software installed from its configured repositories, including applications such as VS Code, Waydroid, Antigravity, browsers, and desktop apps.
+
+It runs each available package manager independently, so one service failure does not prevent the rest from updating. Each run writes a log under `~/.cache/updateall/` and removes logs older than seven days.
+
+Python packages managed by Ubuntu are skipped because Ubuntu protects them from global pip upgrades. Update those through APT or the virtual environment for the project that owns them.
+
+## Options
+
+```bash
+updateall --safe
+updateall --no-cleanup
+updateall --no-firmware
+```
+
+`--safe` prevents APT package removals and skips cleanup. `--no-cleanup` leaves unused packages and caches alone. `--no-firmware` skips firmware metadata and firmware updates. The older `--full`, `--cleanup`, and `--firmware` flags still work because those actions are now enabled by default.
 
 ## Install or remove
 
@@ -23,7 +32,13 @@ cd updateall
 bash install.sh --user
 ```
 
-The user install goes into `~/.local/bin`, which should be on your `PATH`. Re-run the installer after pulling changes. Run `bash uninstall.sh --user` to remove the command. Omit `--user` for installation or removal under `/usr/local/bin`.
+The user installation creates `~/.local/bin/updateall`, so the command works from any directory. Re-run the installer after pulling updates.
+
+```bash
+bash uninstall.sh --user
+```
+
+Omit `--user` to install or remove `/usr/local/bin/updateall` instead.
 
 ## License
 

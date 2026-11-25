@@ -4,31 +4,52 @@ set -o pipefail
 
 usage() {
     cat <<'HELP'
-Usage: updateall [--full] [--cleanup] [--firmware]
+Usage: updateall [--safe] [--no-cleanup] [--no-firmware]
 
-Run as your normal user. System updates ask for sudo when needed.
-  --full      Use APT full-upgrade, with an interactive removal review.
-  --cleanup   Review APT and Homebrew cleanup after upgrading.
-  --firmware  Offer to install firmware updates. The default only checks.
-  --help      Show this help.
+Run as your normal user. updateall asks for your administrator password once.
+
+By default it updates APT packages, Snaps, system and user Flatpaks, firmware,
+writable npm globals, supported Python user packages, pipx apps, user Ruby gems,
+Homebrew packages, and Rust toolchains when they are installed.
+
+  --safe         Keep APT package removals off and skip cleanup.
+  --no-cleanup   Skip APT autoremove and cache cleanup.
+  --no-firmware  Skip firmware metadata and firmware updates.
+  --full         Kept for compatibility. The default already uses full-upgrade.
+  --cleanup      Kept for compatibility. Cleanup is enabled by default.
+  --firmware     Kept for compatibility. Firmware updates are enabled by default.
+  --help         Show this help.
 HELP
 }
 
-full=0
-cleanup=0
-install_firmware=0
+safe=0
+cleanup=1
+firmware=1
 for option; do
     case "$option" in
-        --full) full=1 ;;
+        --safe)
+            safe=1
+            cleanup=0
+            ;;
+        --no-cleanup) cleanup=0 ;;
+        --no-firmware) firmware=0 ;;
+        --full) safe=0 ;;
         --cleanup) cleanup=1 ;;
-        --firmware) install_firmware=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *) printf 'Unknown option: %s\n' "$option" >&2; usage >&2; exit 2 ;;
+        --firmware) firmware=1 ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n' "$option" >&2
+            usage >&2
+            exit 2
+            ;;
     esac
 done
 
 if (( EUID == 0 )); then
-    printf 'Run updateall as your normal user. It calls sudo for system updates.\n' >&2
+    printf 'Run updateall as your normal user. It asks for administrator access when needed.\n' >&2
     exit 2
 fi
 
@@ -44,34 +65,37 @@ find "$log_dir" -maxdepth 1 -type f -name '*.log' -mtime +7 -delete || exit 1
 log_file=$(mktemp "$log_dir/$(date +%F_%H%M%S)_XXXXXX.log") || exit 1
 started=$SECONDS
 failures=0
-# Run global package managers outside whichever project launched updateall.
+
+# Global package managers should not inherit a project directory.
 cd / || exit 1
 
-# The command keeps its terminal input for sudo and package-manager prompts.
-# fwupdmgr uses status 2 when there are no updates to apply.
-step() {
-    local label=$1 no_action_status=$2
-    local -a status
-    shift 2
-    if ! printf '\n[%s]\n' "$label" | tee -a "$log_file"; then
-        (( failures += 1 ))
-        return 1
-    fi
-    "$@" 2>&1 | tee -a "$log_file"
-    status=("${PIPESTATUS[@]}")
-    if (( status[1] != 0 || (status[0] != 0 && status[0] != no_action_status) )); then
-        (( failures += 1 ))
-        printf 'Failed (command %s, log %s).\n' "${status[0]}" "${status[1]}" | tee -a "$log_file"
-        return 1
-    fi
-    printf 'OK\n' | tee -a "$log_file"
+has() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 note() {
     printf '%s\n' "$*" | tee -a "$log_file"
 }
 
-has() { command -v "$1" >/dev/null 2>&1; }
+step() {
+    local label=$1 no_action_status=$2
+    local -a status
+    shift 2
+
+    printf '\n[%s]\n' "$label" | tee -a "$log_file" || return 1
+    "$@" 2>&1 | tee -a "$log_file"
+    status=("${PIPESTATUS[@]}")
+    if (( status[1] != 0 || (status[0] != 0 && status[0] != no_action_status) )); then
+        failures=$((failures + 1))
+        printf 'Failed (command %s, log %s).\n' "${status[0]}" "${status[1]}" | tee -a "$log_file"
+        return 1
+    fi
+    printf 'OK\n' | tee -a "$log_file"
+}
+
+skip() {
+    printf '\n[%s]\nSkipped: %s\n' "$1" "$2" | tee -a "$log_file"
+}
 
 update_user_python() {
     local python_environment outdated
@@ -85,6 +109,7 @@ if sys.prefix != sys.base_prefix:
 elif (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").is_file():
     print("managed")
 ') || return 1
+
     if [[ $python_environment == virtual ]]; then
         printf 'Skipping pip user packages while a Python environment is active.\n'
         return 0
@@ -93,73 +118,112 @@ elif (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").is_file():
         printf 'Skipping pip user packages because this Python is managed by the OS.\n'
         return 0
     fi
+
     outdated=$(python3 -m pip list --outdated --user --format=json |
         python3 -I -c 'import json, sys; print("\n".join(item["name"] for item in json.load(sys.stdin)))') || return 1
     if [[ -z $outdated ]]; then
         printf 'No outdated pip user packages.\n'
         return 0
     fi
+
     local -a packages
     mapfile -t packages <<< "$outdated"
     python3 -m pip install --user --upgrade -- "${packages[@]}"
 }
 
-note "updateall — $(date '+%F %T')"
-if step 'APT package lists' 0 sudo apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update; then
-    if (( full )); then
-        step 'APT full upgrade' 0 sudo apt-get full-upgrade
-        apt_status=$?
-    else
-        step 'APT upgrade' 0 sudo apt-get --with-new-pkgs --no-remove upgrade
-        apt_status=$?
+update_user_rubygems() {
+    local user_gem_home
+    user_gem_home=$(gem env user_gemhome) || return 1
+    if [[ ! -d $user_gem_home/specifications ]] || ! compgen -G "$user_gem_home/specifications/*.gemspec" >/dev/null; then
+        printf 'No user-installed Ruby gems.\n'
+        return 0
     fi
-    if (( apt_status == 0 && cleanup )); then
-        if step 'APT autoremove' 0 sudo apt-get autoremove; then
-            step 'APT autoclean' 0 sudo apt-get autoclean
+    gem update --user-install --no-document
+}
+
+note "updateall — $(date '+%F %T')"
+
+administrator=0
+printf '\n[Administrator access]\n' | tee -a "$log_file"
+if has sudo && sudo -v; then
+    administrator=1
+    printf 'OK\n' | tee -a "$log_file"
+else
+    failures=$((failures + 1))
+    printf 'Unavailable. APT, Snap, system Flatpak, and firmware updates were skipped.\n' | tee -a "$log_file"
+fi
+
+if (( administrator )); then
+    if step 'APT package lists' 0 sudo apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update; then
+        if (( safe )); then
+            step 'APT safe upgrade' 0 sudo env DEBIAN_FRONTEND=noninteractive apt-get -y \
+                -o APT::Get::Always-Include-Phased-Updates=true --with-new-pkgs --no-remove upgrade
+        else
+            step 'APT full upgrade' 0 sudo env DEBIAN_FRONTEND=noninteractive apt-get -y \
+                -o APT::Get::Always-Include-Phased-Updates=true full-upgrade
         fi
+        apt_status=$?
+        if (( apt_status == 0 && cleanup )); then
+            if step 'APT unused packages' 0 sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove; then
+                step 'APT cache cleanup' 0 sudo apt-get -y autoclean
+            fi
+        fi
+    else
+        note 'Skipped APT upgrades because package lists could not be refreshed.'
     fi
 else
-    note 'Skipped APT upgrade because the package lists could not be refreshed.'
+    skip 'APT' 'administrator access is required'
 fi
 
 if has snap; then
-    step 'Snap refresh' 0 sudo snap refresh
+    if (( administrator )); then
+        step 'Snap refresh' 0 sudo snap refresh
+    else
+        skip 'Snap refresh' 'administrator access is required'
+    fi
 fi
+
 if has flatpak; then
-    step 'Flatpak system updates' 0 flatpak --system update
-    step 'Flatpak user updates' 0 flatpak --user update
+    if (( administrator )); then
+        step 'Flatpak system updates' 0 sudo flatpak --system update --assumeyes --noninteractive
+    else
+        skip 'Flatpak system updates' 'administrator access is required'
+    fi
+    step 'Flatpak user updates' 0 flatpak --user update --assumeyes --noninteractive
 fi
+
 if has fwupdmgr; then
-    if step 'Firmware metadata' 2 fwupdmgr refresh; then
-        if (( install_firmware )); then
-            step 'Firmware installation' 2 fwupdmgr update
-        else
-            step 'Firmware update check' 2 fwupdmgr get-updates
+    if (( administrator && firmware )); then
+        if step 'Firmware metadata' 2 sudo fwupdmgr refresh --force; then
+            step 'Firmware updates' 2 sudo fwupdmgr update --assume-yes
         fi
+    elif (( ! firmware )); then
+        skip 'Firmware updates' 'disabled by --no-firmware'
+    else
+        skip 'Firmware updates' 'administrator access is required'
     fi
 fi
+
 if has npm; then
-    if npm_prefix=$(npm prefix -g 2>>"$log_file"); then
-        if [[ -w $npm_prefix/lib/node_modules ]]; then
-            step 'npm global packages' 0 npm update --global
-        else
-            note "Skipped npm globals because $npm_prefix/lib/node_modules is absent or read-only."
-        fi
+    if npm_prefix=$(npm prefix -g 2>>"$log_file") && [[ -w $npm_prefix/lib/node_modules ]]; then
+        step 'npm global packages' 0 npm update --global
     else
-        (( failures += 1 ))
-        note 'Could not determine the npm global prefix. See the log.'
+        skip 'npm global packages' 'the global npm directory is unavailable or read-only'
     fi
 fi
+
 if has python3 && python3 -m pip --version >/dev/null 2>&1; then
-    if [[ -n ${VIRTUAL_ENV:-} || -n ${CONDA_PREFIX:-} ]]; then
-        note 'Skipped pip user packages while a Python environment is active.'
-    else
-        step 'Python user packages' 0 update_user_python
-    fi
+    step 'Python user packages' 0 update_user_python
 fi
+
 if has pipx; then
     step 'pipx applications' 0 pipx upgrade-all
 fi
+
+if has gem; then
+    step 'Ruby user gems' 0 update_user_rubygems
+fi
+
 if has brew; then
     if step 'Homebrew metadata' 0 brew update && step 'Homebrew packages' 0 brew upgrade; then
         if (( cleanup )); then
@@ -167,6 +231,7 @@ if has brew; then
         fi
     fi
 fi
+
 if has rustup; then
     step 'Rust toolchains' 0 rustup update
 fi
@@ -175,5 +240,5 @@ note "Finished in $((SECONDS - started))s ($failures failed)."
 if [[ -e /var/run/reboot-required ]]; then
     note 'Reboot required.'
 fi
-note "Log: $log_file" || exit 1
+note "Log: $log_file"
 (( failures == 0 ))
