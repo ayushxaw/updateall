@@ -33,7 +33,10 @@ for option; do
             ;;
         --no-cleanup) cleanup=0 ;;
         --no-firmware) firmware=0 ;;
-        --full) safe=0 ;;
+        --full)
+            safe=0
+            cleanup=1
+            ;;
         --cleanup) cleanup=1 ;;
         --firmware) firmware=1 ;;
         -h|--help)
@@ -69,12 +72,47 @@ failures=0
 # Global package managers should not inherit a project directory.
 cd / || exit 1
 
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    style_reset=$'\033[0m'
+    style_bold=$'\033[1m'
+    style_dim=$'\033[2m'
+    style_blue=$'\033[38;5;33m'
+    style_green=$'\033[38;5;40m'
+    style_yellow=$'\033[38;5;220m'
+    style_red=$'\033[38;5;196m'
+else
+    style_reset=''
+    style_bold=''
+    style_dim=''
+    style_blue=''
+    style_green=''
+    style_yellow=''
+    style_red=''
+fi
+
 has() {
     command -v "$1" >/dev/null 2>&1
 }
 
+write_log() {
+    printf '%s\n' "$*" >> "$log_file"
+}
+
 note() {
-    printf '%s\n' "$*" | tee -a "$log_file"
+    printf '%s%s%s\n' "$style_dim" "$*" "$style_reset"
+    write_log "$*"
+}
+
+section() {
+    printf '\n%s%s━━ %s ━━%s\n' "$style_bold" "$style_blue" "$1" "$style_reset"
+    write_log "=== $1 ==="
+}
+
+banner() {
+    printf '\n%s%supdateall%s  %supdate almost everything with one command%s\n' \
+        "$style_bold" "$style_blue" "$style_reset" "$style_dim" "$style_reset"
+    printf '%s%s%s\n' "$style_dim" "$(date '+%F %T')" "$style_reset"
+    write_log "updateall — $(date '+%F %T')"
 }
 
 step() {
@@ -82,19 +120,23 @@ step() {
     local -a status
     shift 2
 
-    printf '\n[%s]\n' "$label" | tee -a "$log_file" || return 1
+    printf '\n%s▶%s %s\n' "$style_blue" "$style_reset" "$label"
+    write_log "[$label]"
     "$@" 2>&1 | tee -a "$log_file"
     status=("${PIPESTATUS[@]}")
     if (( status[1] != 0 || (status[0] != 0 && status[0] != no_action_status) )); then
         failures=$((failures + 1))
-        printf 'Failed (command %s, log %s).\n' "${status[0]}" "${status[1]}" | tee -a "$log_file"
+        printf '%s✗%s %s failed%s\n' "$style_red" "$style_reset" "$label" "$style_reset"
+        write_log "Failed (command ${status[0]}, log ${status[1]})."
         return 1
     fi
-    printf 'OK\n' | tee -a "$log_file"
+    printf '%s✓%s %s\n' "$style_green" "$style_reset" "$label"
+    write_log 'OK'
 }
 
 skip() {
-    printf '\n[%s]\nSkipped: %s\n' "$1" "$2" | tee -a "$log_file"
+    printf '\n%s–%s %s %s(%s)%s\n' "$style_yellow" "$style_reset" "$1" "$style_dim" "$2" "$style_reset"
+    write_log "[$1] Skipped: $2"
 }
 
 update_user_python() {
@@ -141,16 +183,20 @@ update_user_rubygems() {
     gem update --user-install --no-document
 }
 
-note "updateall — $(date '+%F %T')"
+banner
+section 'System updates'
 
 administrator=0
-printf '\n[Administrator access]\n' | tee -a "$log_file"
+printf '\n%s▶%s Administrator access\n' "$style_blue" "$style_reset"
+write_log '[Administrator access]'
 if has sudo && sudo -v; then
     administrator=1
-    printf 'OK\n' | tee -a "$log_file"
+    printf '%s✓%s Administrator access\n' "$style_green" "$style_reset"
+    write_log 'OK'
 else
     failures=$((failures + 1))
-    printf 'Unavailable. APT, Snap, system Flatpak, and firmware updates were skipped.\n' | tee -a "$log_file"
+    printf '%s✗%s Administrator access unavailable%s\n' "$style_red" "$style_reset" "$style_reset"
+    note 'APT, Snap, system Flatpak, and firmware updates were skipped.'
 fi
 
 if (( administrator )); then
@@ -189,7 +235,6 @@ if has flatpak; then
     else
         skip 'Flatpak system updates' 'administrator access is required'
     fi
-    step 'Flatpak user updates' 0 flatpak --user update --assumeyes --noninteractive
 fi
 
 if has fwupdmgr; then
@@ -203,6 +248,13 @@ if has fwupdmgr; then
         skip 'Firmware updates' 'administrator access is required'
     fi
 fi
+
+if has flatpak; then
+    section 'Application updates'
+    step 'Flatpak user updates' 0 flatpak --user update --assumeyes --noninteractive
+fi
+
+section 'Developer tools'
 
 if has npm; then
     if npm_prefix=$(npm prefix -g 2>>"$log_file") && [[ -w $npm_prefix/lib/node_modules ]]; then
@@ -236,9 +288,20 @@ if has rustup; then
     step 'Rust toolchains' 0 rustup update
 fi
 
-note "Finished in $((SECONDS - started))s ($failures failed)."
-if [[ -e /var/run/reboot-required ]]; then
-    note 'Reboot required.'
+printf '\n%s────────────────────────────────────────%s\n' "$style_dim" "$style_reset"
+if (( failures == 0 )); then
+    printf '%s✓%s Finished in %ss — all available updates completed.\n' \
+        "$style_green" "$style_reset" "$((SECONDS - started))"
+    write_log "Finished in $((SECONDS - started))s (0 failed)."
+else
+    printf '%s✗%s Finished in %ss — %s step(s) need attention.\n' \
+        "$style_red" "$style_reset" "$((SECONDS - started))" "$failures"
+    write_log "Finished in $((SECONDS - started))s ($failures failed)."
 fi
-note "Log: $log_file"
+if [[ -e /var/run/reboot-required ]]; then
+    printf '%s!%s Reboot required.\n' "$style_yellow" "$style_reset"
+    write_log 'Reboot required.'
+fi
+printf '%sLog:%s %s\n' "$style_dim" "$style_reset" "$log_file"
+write_log "Log: $log_file"
 (( failures == 0 ))

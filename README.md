@@ -12,6 +12,8 @@ APT uses a full upgrade and includes Ubuntu phased updates. It also removes unus
 
 It runs each available package manager independently, so one service failure does not prevent the rest from updating. Each run writes a log under `~/.cache/updateall/` and removes logs older than seven days.
 
+When run in an interactive terminal, it shows clean colour-coded sections, completed/skipped/failed status marks, and a compact summary. Its log files remain plain text.
+
 Python packages managed by Ubuntu are skipped because Ubuntu protects them from global pip upgrades. Update those through APT or the virtual environment for the project that owns them.
 
 ## Options
