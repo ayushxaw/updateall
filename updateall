@@ -9,8 +9,9 @@ Usage: updateall [--safe] [--no-cleanup] [--no-firmware]
 Run as your normal user. updateall asks for your administrator password once.
 
 By default it updates APT packages, Snaps, system and user Flatpaks, firmware,
-writable npm globals, supported Python user packages, pipx apps, user Ruby gems,
-Homebrew packages, and Rust toolchains when they are installed.
+RustDesk (unattended Wayland .deb), writable npm globals, supported Python user
+packages, pipx apps, user Ruby gems, Homebrew packages, and Rust toolchains
+when they are installed.
 
   --safe         Keep APT package removals off and skip cleanup.
   --no-cleanup   Skip APT autoremove and cache cleanup.
@@ -139,6 +140,56 @@ skip() {
     write_log "[$1] Skipped: $2"
 }
 
+update_rustdesk_wayland() (
+    local package=rustdesk-unattended-wayland installed=$1
+    local release version asset digest temp_dir deb holds
+
+    if ! has curl || ! has jq; then
+        printf '%s\n' 'RustDesk updates require curl and jq.' >&2
+        return 1
+    fi
+
+    holds=$(apt-mark showhold) || return 1
+    if [[ $'\n'$holds$'\n' == *$'\n'"$package"$'\n'* || $'\n'$holds$'\n' == *$'\n'"$package:amd64"$'\n'* ]]; then
+        printf '%s\n' 'RustDesk is held in APT.'
+        return 0
+    fi
+
+    release=$(curl --fail --silent --show-error --location --proto '=https' \
+        --retry 2 --max-time 60 https://api.github.com/repos/rustdesk/rustdesk/releases/latest) || return 1
+    version=$(jq -er '.tag_name | select(test("^[0-9]+[.][0-9]+[.][0-9]+$"))' <<< "$release") || return 1
+    if ! dpkg --compare-versions "$version" gt "$installed"; then
+        printf 'RustDesk %s is up to date.\n' "$installed"
+        return 0
+    fi
+
+    asset="$package-$version-x86_64.deb"
+    digest=$(jq -er --arg asset "$asset" \
+        '.assets[] | select(.name == $asset) | .digest | select(test("^sha256:[0-9a-f]{64}$"))' \
+        <<< "$release") || {
+        printf 'No verified upstream asset for %s.\n' "$asset" >&2
+        return 1
+    }
+
+    temp_dir=$(mktemp -d) || return 1
+    deb="$temp_dir/$asset"
+    trap 'rm -f -- "$deb"; rmdir -- "$temp_dir"' EXIT
+    printf 'RustDesk %s → %s\n' "$installed" "$version"
+    curl --fail --silent --show-error --location --proto '=https' --retry 2 --max-time 300 \
+        --output "$deb" "https://github.com/rustdesk/rustdesk/releases/download/$version/$asset" || return 1
+    printf '%s  %s\n' "${digest#sha256:}" "$deb" | sha256sum --check --status || {
+        printf '%s\n' 'RustDesk download failed SHA-256 verification.' >&2
+        return 1
+    }
+    if [[ $(dpkg-deb -f "$deb" Package) != "$package" ||
+          $(dpkg-deb -f "$deb" Architecture) != amd64 ||
+          $(dpkg-deb -f "$deb" Version) != "$version" ]]; then
+        printf '%s\n' 'RustDesk package metadata does not match the expected release.' >&2
+        return 1
+    fi
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove --only-upgrade install "$deb"
+)
+
 update_user_python() {
     local python_environment outdated
     python_environment=$(python3 -I -c '
@@ -249,8 +300,20 @@ if has fwupdmgr; then
     fi
 fi
 
-if has flatpak; then
+rustdesk_status=$(dpkg-query -W -f='${db:Status-Status} ${Version}' rustdesk-unattended-wayland:amd64 2>/dev/null)
+if has flatpak || [[ $rustdesk_status == 'installed '* ]]; then
     section 'Application updates'
+fi
+
+if [[ $rustdesk_status == 'installed '* ]]; then
+    if (( administrator )); then
+        step 'RustDesk unattended Wayland' 0 update_rustdesk_wayland "${rustdesk_status#installed }"
+    else
+        skip 'RustDesk unattended Wayland' 'administrator access is required'
+    fi
+fi
+
+if has flatpak; then
     step 'Flatpak user updates' 0 flatpak --user update --assumeyes --noninteractive
 fi
 
